@@ -1,11 +1,23 @@
+//--------------------------------------------------------------------------------------//
+// PROJECT1: COMPUTE ARTIST
+//--------------------------------------------------------------------------------------//
+#define VK_ENABLE_BETA_EXTENSIONS
 #include <vulkan/vulkan.h>
-#define GLFW_INCLUDE_NONE
+#include <vulkan/vk_enum_string_helper.h> //if we want to print out enum names
+#define GLFW_INCLUDE_NONE //"no, do not include OpenGL"
 #include <GLFW/glfw3.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <vector>
+#include <iostream>
+#include <chrono>
+#include <cmath>
+#include <fstream>
+#include <filesystem>
+#include <random>
 
 //macro function to check the return value of Vulkan API calls. Print an error message and aborts the program if it fails
 #define VK_CHECK(call)                                                  \
@@ -18,9 +30,12 @@
         }                                                               \
     } while (0)
 
-
-static const uint32_t WINDOW_WIDTH = 800;
-static const uint32_t WINDOW_HEIGHT = 800;
+static const uint32_t WINDOW_WIDTH = 1200;
+static const uint32_t WINDOW_HEIGHT = 1200;
+static const uint32_t FRAME_WIDTH = 400;
+static const uint32_t FRAME_HEIGHT = 400;
+static const uint32_t FRAMES_IN_FLIGHT = 2;
+static const char* COMPUTE_SHADER_PATH = SHADER_DIR "/mapgenerator.comp.spv";
 
 //validation layers pass debug messages to this function
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT message_severity,
@@ -33,13 +48,90 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverity
     (void)user_data;
 
     std::fprintf(stderr, "[validation] %s\n", callback_data->pMessage);
+
+    static std::ofstream log_file("validation.txt", std::ios::out | std::ios::trunc);
+
+    if (log_file.is_open()) {
+        log_file << "[validation] " << callback_data->pMessage << "\n";
+        log_file << std::flush;
+    }
+
     return VK_FALSE;
+}
+
+//set up our validation.txt file
+static std::ofstream& ValidationLog()
+{
+    static std::ofstream log_file("validation.txt", std::ios::out | std::ios::trunc);
+    return log_file;
+}
+
+//check if our physical device supports a certain device extension
+static bool DeviceSupportsExtension(VkPhysicalDevice physical_device, const char* extension_name)
+{
+    uint32_t extension_count = 0;
+    VK_CHECK(vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &extension_count, nullptr));
+
+    std::vector<VkExtensionProperties> extensions(extension_count);
+    VK_CHECK(vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &extension_count, extensions.data()));
+
+    for (uint32_t i = 0; i < extension_count; ++i) {
+        if (std::strcmp(extensions[i].extensionName, extension_name) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+//check if our Vulkan instance supports a certain instance extension
+static bool InstanceSupportsExtension(const char* extension_name)
+{
+    uint32_t extension_count = 0;
+    VK_CHECK(vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, nullptr));
+
+    std::vector<VkExtensionProperties> extensions(extension_count);
+    VK_CHECK(vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, extensions.data()));
+
+    for (uint32_t i = 0; i < extension_count; ++i) {
+        if (std::strcmp(extensions[i].extensionName, extension_name) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+//check if a certain bit index is set in a mask
+static bool BitIsSet(uint32_t mask, uint32_t bit_index)
+{
+    return (mask & (1u << bit_index)) != 0;
+}
+
+//helper function to interpret shader code as a uint32 vec
+static std::vector<uint32_t> ReadSpirv(const char* path)
+{
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+
+    if (!file.is_open()) {
+        std::fprintf(stderr, "failed to open shader file: %s\n", std::filesystem::absolute(path).string().c_str());
+        std::abort();
+    }
+
+    size_t size_in_bytes = (size_t)file.tellg();
+    std::vector<uint32_t> code(size_in_bytes / sizeof(uint32_t));
+
+    file.seekg(0);
+    file.read((char*)code.data(), size_in_bytes);
+
+    return code;
 }
 
 int main()
 {
-
-    //----------------------------------------WINDOW----------------------------------------//
+    //--------------------------------------------------------------------------------------//
+    // WINDOW CREATION
+    //--------------------------------------------------------------------------------------//
 
     //initialize glfw
     if (!glfwInit()) {
@@ -52,7 +144,7 @@ int main()
 
     glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
 
-    const char *window_title = "P3DG-Assignment0";
+    const char* window_title = "P3DG-PROJECT1";
 
     GLFWwindow* window = glfwCreateWindow(WINDOW_WIDTH, WINDOW_HEIGHT, window_title, nullptr, nullptr);
 
@@ -60,19 +152,13 @@ int main()
         std::fprintf(stderr, "glfwCreateWindow failed\n");
         return EXIT_FAILURE;
     }
-    
-    //---------------------------------------INSTANCE---------------------------------------//
 
-    VkApplicationInfo appplication_info = {
-        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-        .pNext = nullptr,
-        .pApplicationName = window_title,
-        .applicationVersion = VK_MAKE_API_VERSION(0, 1, 0, 0),
-        .pEngineName = "none",
-        .engineVersion = VK_MAKE_API_VERSION(0, 1, 0, 0),
+    ValidationLog() << "=== VALIDATION LOG: " << window_title << " ===\n" << std::flush;
+    std::fprintf(stderr, "[info] validation log location: %s\n", std::filesystem::absolute("validation.txt").string().c_str());
 
-        .apiVersion = VK_API_VERSION_1_3,
-    };
+    //--------------------------------------------------------------------------------------//
+    // INSTANCE CREATION
+    //--------------------------------------------------------------------------------------//
 
     //glfw needs certain vulkan instance extensions to be enabled to perform core functions like creating a window surface. we query for them here
     uint32_t glfw_extension_count = 0;
@@ -93,7 +179,7 @@ int main()
     //describe our debug messanger
     VkDebugUtilsMessengerCreateInfoEXT debug_messenger_create_info = {
         .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
-        .pNext = nullptr,
+        .pNext = NULL,
         .flags = 0,
         .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
                            VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
@@ -104,12 +190,53 @@ int main()
         .pUserData = nullptr,
     };
 
+    //let's enable synchronization validation to make sure our stage mask targets are correct
+    instance_extensions.push_back(VK_EXT_LAYER_SETTINGS_EXTENSION_NAME);
+
+    VkBool32 validate_sync_enabled = VK_TRUE;
+
+    VkLayerSettingEXT layer_settings[] = {
+        {
+            .pLayerName = "VK_LAYER_KHRONOS_validation",
+            .pSettingName = "validate_sync",
+            .type = VK_LAYER_SETTING_TYPE_BOOL32_EXT,
+            .valueCount = 1,
+            .pValues = &validate_sync_enabled,
+        },
+    };
+
+    VkLayerSettingsCreateInfoEXT layer_settings_create_info = {
+        .sType = VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT,
+        .pNext = &debug_messenger_create_info,
+        .settingCount = sizeof(layer_settings) / sizeof(layer_settings[0]),
+        .pSettings = layer_settings,
+    };
+
+    VkInstanceCreateFlags instance_create_flags = 0;
+    //mac support
+    if (InstanceSupportsExtension(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+        instance_extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+        instance_create_flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    }
+
+    //describe our application
+    VkApplicationInfo application_info = {
+        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        .pNext = NULL,
+        .pApplicationName = window_title,
+        .applicationVersion = VK_MAKE_API_VERSION(0, 1, 0, 0),
+        .pEngineName = "none",
+        .engineVersion = VK_MAKE_API_VERSION(0, 1, 0, 0),
+
+        .apiVersion = VK_API_VERSION_1_3,
+    };
+
     //describe our Vulkan instance
     VkInstanceCreateInfo instance_create_info = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-        .pNext = &debug_messenger_create_info,
-        .flags = 0,
-        .pApplicationInfo = &appplication_info,
+        .pNext = &layer_settings_create_info,
+        .flags = instance_create_flags,
+        .pApplicationInfo = &application_info,
         .enabledLayerCount = sizeof(enabled_layers) / sizeof(enabled_layers[0]),
         .ppEnabledLayerNames = enabled_layers,
         .enabledExtensionCount = (uint32_t)instance_extensions.size(),
@@ -118,7 +245,8 @@ int main()
 
     //create our Vulkan instance
     VkInstance instance = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateInstance(&instance_create_info, nullptr, &instance));
+    VkResult instance_creation_result = vkCreateInstance(&instance_create_info, nullptr, &instance);
+    VK_CHECK(instance_creation_result);
 
     //since extension functions are not loaded in by default (after all, they are extensions), we have to query the function as a pointer in order to use it
     PFN_vkCreateDebugUtilsMessengerEXT pfn_create_debug_utils_messengerEXT =
@@ -128,14 +256,18 @@ int main()
     //establish the debug messanger callback
     VkDebugUtilsMessengerEXT debug_messenger = VK_NULL_HANDLE;
     VK_CHECK(pfn_create_debug_utils_messengerEXT(instance, &debug_messenger_create_info, nullptr, &debug_messenger));
-    
-    //----------------------------------------SURFACE---------------------------------------//
+
+    //--------------------------------------------------------------------------------------//
+    // SURFACE CREATION
+    //--------------------------------------------------------------------------------------//
     
     //create the surface
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     VK_CHECK(glfwCreateWindowSurface(instance, window, nullptr, &surface));
-    
-    //------------------------------------PHYSICAL DEVICE-----------------------------------//
+
+    //--------------------------------------------------------------------------------------//
+    // PHYSICAL DEVICE SELECTION
+    //--------------------------------------------------------------------------------------//
 
     //simply check the number of available physical devices (GPUs), don't get their data yet
     uint32_t physical_device_count = 0;
@@ -157,8 +289,7 @@ int main()
         VkPhysicalDeviceProperties physical_device_properties = {};
         vkGetPhysicalDeviceProperties(physical_devices[i], &physical_device_properties);
 
-        if (physical_device_properties.apiVersion < VK_API_VERSION_1_3)
-        {
+        if (physical_device_properties.apiVersion < VK_API_VERSION_1_3) {
             continue;
         }
 
@@ -187,6 +318,10 @@ int main()
             continue;
         }
 
+        if (physical_device != VK_NULL_HANDLE && physical_device_properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
+            continue;
+        }
+
         physical_device = physical_devices[i];
 
         if (physical_device_properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
@@ -199,12 +334,9 @@ int main()
         return EXIT_FAILURE;
     }
 
-    //let's confirm what the name of our selected physical device is...
-    VkPhysicalDeviceProperties physical_device_properties = {};
-    vkGetPhysicalDeviceProperties(physical_device, &physical_device_properties);
-    std::printf("Selected GPU: %s\n", physical_device_properties.deviceName);
-
-    //-------------------------------LOGICAL DEVICE AND QUEUE-------------------------------//
+    //--------------------------------------------------------------------------------------//
+    // LOGICAL DEVICE & QUEUE CREATION
+    //--------------------------------------------------------------------------------------//
 
     //queue priority is useful for > 1 queue but still necessary for == 1, ranges from 0.0-1.0
     //(it's used for prioritizing queues when scheduling)
@@ -213,7 +345,7 @@ int main()
     //describe our queue
     VkDeviceQueueCreateInfo device_queue_create_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-        .pNext = nullptr,
+        .pNext = NULL,
         .flags = 0,
         .queueFamilyIndex = queue_family_index,
         .queueCount = 1,
@@ -224,13 +356,18 @@ int main()
     //they default to VK_FALSE, so we enable them here and pass it to the logical device creation info
     VkPhysicalDeviceVulkan13Features vulkan_1_3_features = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-        .pNext = nullptr,
+        .pNext = NULL,
         .synchronization2 = VK_TRUE,
         .dynamicRendering = VK_TRUE,
     };
 
     //presenting a surface (and by extension, using a swapchain) is not core Vulkan but rather a device extension
-    const char* device_extensions[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+    std::vector<const char*> device_extensions = { VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+
+    //mac support
+    if (DeviceSupportsExtension(physical_device, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
+        device_extensions.push_back(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+    }
 
     //describe our logical device that serves as the interface between our Vulkan instance and our physical device (GPU)
     VkDeviceCreateInfo device_create_info = {
@@ -239,11 +376,8 @@ int main()
         .flags = 0,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &device_queue_create_info,
-        .enabledLayerCount = 0, //deprecated
-        .ppEnabledLayerNames = nullptr, //deprecated
-        .enabledExtensionCount = sizeof(device_extensions) / sizeof(device_extensions[0]),
-        .ppEnabledExtensionNames = device_extensions,
-        .pEnabledFeatures = nullptr,
+        .enabledExtensionCount = (uint32_t)device_extensions.size(),
+        .ppEnabledExtensionNames = device_extensions.data(),
     };
 
     //create our logical device and its queues 
@@ -252,15 +386,19 @@ int main()
 
     //retrieve the handle of the queue generated with the logical device
     VkQueue queue = VK_NULL_HANDLE;
-    vkGetDeviceQueue(device, queue_family_index, 0, &queue);
+    uint32_t queue_index = 0;
+    vkGetDeviceQueue(device, queue_family_index, queue_index, &queue);
 
-    //---------------------------------------SWAPCHAIN--------------------------------------//
+    //--------------------------------------------------------------------------------------//
+    // SWAPCHAIN CREATION
+    //--------------------------------------------------------------------------------------//
 
     //let's check if our physical device supports the transfer op we're going to use later
-    //(don't worry, it practically always is)  
+    //(don't worry, it practically always is)
     VkSurfaceCapabilitiesKHR surface_capabilities = {};
     VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, &surface_capabilities));
 
+    //VK_IMAGE_USAGE_TRANSFER_DST_BIT is the flag that signifies the image can be used as the destination for a transfer op
     if (!(surface_capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
         std::fprintf(stderr, "Surface does not support VK_IMAGE_USAGE_TRANSFER_DST_BIT\n");
         return EXIT_FAILURE;
@@ -278,7 +416,7 @@ int main()
     //at least one format is guaranteed to exist
     VkSurfaceFormatKHR surface_format = surface_formats[0];
     for (uint32_t i = 0; i < surface_format_count; ++i) {
-        if (surface_formats[i].format == VK_FORMAT_B8G8R8A8_SRGB &&
+        if (surface_formats[i].format == VK_FORMAT_B8G8R8A8_UNORM &&
             surface_formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
             surface_format = surface_formats[i];
             break;
@@ -306,19 +444,18 @@ int main()
     //describe our swapchain
     VkSwapchainCreateInfoKHR swapchain_create_info = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
-        .pNext = nullptr,
+        .pNext = NULL,
         .flags = 0,
         .surface = surface,
         .minImageCount = swapchain_min_image_count,
         .imageFormat = surface_format.format,
         .imageColorSpace = surface_format.colorSpace,
         .imageExtent = swapchain_extent,
-        // more than 1 only used for stereoscopic rendering
+        //more than 1 only used for stereoscopic rendering
         .imageArrayLayers = 1,
-        // transfer dst is here bc we clear via a transfer command
-        // color attachment won't be used until we have a fully-fledged pipeline
+        //transfer dst is here bc we clear via a transfer command
+        //color attachment won't be used until we have a fully-fledged pipeline
         .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
-        //"do we plan on sharing these images with other queue families?"
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
@@ -342,12 +479,14 @@ int main()
     std::vector<VkImage> swapchain_images(swapchain_image_count);
     VK_CHECK(vkGetSwapchainImagesKHR(device, swapchain, &swapchain_image_count, swapchain_images.data()));
 
-    //----------------------------COMMAND POOL AND COMMAND BUFFER0--------------------------//
+    //--------------------------------------------------------------------------------------//
+    // COMMAND POOL CREATION & COMMAND BUFFER ALLOCATION 
+    //--------------------------------------------------------------------------------------//
 
     //describe our command pool
     VkCommandPoolCreateInfo command_pool_create_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-        .pNext = nullptr,
+        .pNext = NULL,
         //this flag enables vkResetCommandBuffer which we need because we are re-recording the command buffers on each frame
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
         //a command pool is bound to (& effectively owned by) one queue family.
@@ -362,85 +501,582 @@ int main()
     //describe the buffer(s) we are going to create
     VkCommandBufferAllocateInfo command_buffer_allocate_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .pNext = nullptr,
+        .pNext = NULL,
         .commandPool = command_pool,
         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = 1,
+        .commandBufferCount = FRAMES_IN_FLIGHT,
     };
 
     //allocate (create) command buffers for the pool we've made
-    VkCommandBuffer command_buffer = VK_NULL_HANDLE;
-    VK_CHECK(vkAllocateCommandBuffers(device, &command_buffer_allocate_info, &command_buffer));
+    std::vector<VkCommandBuffer> command_buffers(FRAMES_IN_FLIGHT);
+    VK_CHECK(vkAllocateCommandBuffers(device, &command_buffer_allocate_info, command_buffers.data()));
 
-    //--------------------------------SYNCHRONIZATION OBJECTS-------------------------------//
+    //--------------------------------------------------------------------------------------//
+    // IMAGE ALLOCATION
+    //--------------------------------------------------------------------------------------//
 
-    //describe our semaphores
+    VkImageCreateInfo image_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R32_UINT,
+        .extent = {
+            .width = FRAME_WIDTH,
+            .height = FRAME_HEIGHT,
+            .depth = 1,
+        },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    
+    std::vector<VkImage> world(2);
+    std::vector<VkImageView> world_view(2);
+
+    for (uint32_t i = 0; i < 2; ++i) {
+        VK_CHECK(vkCreateImage(device, &image_info, nullptr, &world[i])); //creates the VkImage handle (equivalent to VkBuffer)
+    }
+
+    image_info.format = VK_FORMAT_R8G8B8A8_UNORM; // Set the desired format for the image
+    image_info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT; 
+
+    std::vector<VkImage> frame(FRAMES_IN_FLIGHT);
+    for (uint32_t i = 0; i < FRAMES_IN_FLIGHT; ++i) {
+        VK_CHECK(vkCreateImage(device, &image_info, nullptr, &frame[i])); //creates the VkImage handle (equivalent to VkBuffer)
+    }
+
+    VkPhysicalDeviceMemoryProperties memory_properties = {};
+    vkGetPhysicalDeviceMemoryProperties(physical_device, &memory_properties);
+
+    VkMemoryRequirements frame_requirements = {};
+    VkMemoryRequirements world_requirements = {};
+
+    vkGetImageMemoryRequirements(device, frame[0], &frame_requirements);
+    vkGetImageMemoryRequirements(device, world[0], &world_requirements);
+
+    VkMemoryPropertyFlags property_flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+    uint32_t memory_type_index = UINT32_MAX;
+    uint32_t allowed_memory_type_bits = frame_requirements.memoryTypeBits & world_requirements.memoryTypeBits;
+
+    for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i) {
+        bool type_allowed = BitIsSet(allowed_memory_type_bits, i);
+        bool has_properties = (memory_properties.memoryTypes[i].propertyFlags & property_flags) == property_flags;
+
+        if (type_allowed && has_properties) {
+            memory_type_index = i;
+            break;
+        }
+    }
+
+    if (memory_type_index == UINT32_MAX) {
+        std::fprintf(stderr, "No host-visible coherent memory type available\n");
+        return EXIT_FAILURE;
+    }
+
+    VkDeviceSize stride = ((frame_requirements.size + frame_requirements.alignment - 1) / frame_requirements.alignment) * frame_requirements.alignment;
+    VkDeviceSize world_stride = ((world_requirements.size + world_requirements.alignment - 1) / world_requirements.alignment) * world_requirements.alignment;
+
+    VkDeviceSize frame_size = stride * FRAMES_IN_FLIGHT;
+    VkDeviceSize world_size = world_stride * 2;
+
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = NULL,
+        .allocationSize = world_size,
+        .memoryTypeIndex = memory_type_index,
+    };
+    
+    VkDeviceMemory world_memory = VK_NULL_HANDLE;
+    VK_CHECK(vkAllocateMemory(device, &alloc_info, nullptr, &world_memory)); //allocates a VkMemory block
+
+    alloc_info.allocationSize = frame_size; // Allocate additional memory for the frame images
+
+    VkDeviceMemory frame_memory = VK_NULL_HANDLE;
+    VK_CHECK(vkAllocateMemory(device, &alloc_info, nullptr, &frame_memory));
+
+    std::vector<VkImageView> frame_view(FRAMES_IN_FLIGHT);
+
+    for (uint32_t i = 0; i < 2; ++i) {
+        VkDeviceSize bind_offset = i * world_stride;
+        VK_CHECK(vkBindImageMemory(device, world[i], world_memory, bind_offset)); //binds VkImage handle to VkMemory block
+
+        //to create the image view...
+        VkImageViewCreateInfo view_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = world[i],
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = VK_FORMAT_R32_UINT,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        };
+        VK_CHECK(vkCreateImageView(device, &view_info, nullptr, &world_view[i])); //creates the VkImageView handle
+    }
+
+    for (uint32_t i = 0; i < FRAMES_IN_FLIGHT; ++i) {
+        VkDeviceSize bind_offset = i * stride;
+        VK_CHECK(vkBindImageMemory(device, frame[i], frame_memory, bind_offset)); //binds VkImage handle to VkMemory block
+
+        //to create the image view...
+        VkImageViewCreateInfo view_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = frame[i],
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = VK_FORMAT_R8G8B8A8_UNORM,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        };
+        VK_CHECK(vkCreateImageView(device, &view_info, nullptr, &frame_view[i])); //creates the VkImageView handle
+    }
+
+    VkDescriptorPoolSize descriptor_pool_size = {
+        .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        .descriptorCount = FRAMES_IN_FLIGHT,
+    };
+
+    VkDescriptorPoolCreateInfo descriptor_pool_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .maxSets = FRAMES_IN_FLIGHT,
+        .poolSizeCount = 1,
+        .pPoolSizes = &descriptor_pool_size,
+    };
+
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateDescriptorPool(device, &descriptor_pool_info, NULL, &descriptor_pool));
+
+    VkDescriptorSetLayoutBinding descriptor_set_layout_binding = {
+        .binding = 0,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+    };
+
+    VkDescriptorSetLayoutCreateInfo descriptor_set_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .bindingCount = 1,
+        .pBindings = &descriptor_set_layout_binding,
+    };
+
+    std::vector<VkDescriptorSetLayout> descriptor_set_layout(FRAMES_IN_FLIGHT);
+    for (uint32_t i = 0; i < FRAMES_IN_FLIGHT; ++i) {  
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &descriptor_set_layout_info, NULL, &descriptor_set_layout[i]));
+    }
+
+    VkDescriptorSetAllocateInfo descriptor_set_allocate_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .pNext = NULL,
+        .descriptorPool = descriptor_pool,
+        .descriptorSetCount = FRAMES_IN_FLIGHT,
+        .pSetLayouts = descriptor_set_layout.data(),
+    };
+
+    std::vector<VkDescriptorSet> descriptor_set(FRAMES_IN_FLIGHT);
+    VK_CHECK(vkAllocateDescriptorSets(device, &descriptor_set_allocate_info, descriptor_set.data()));
+
+    for (uint32_t i = 0; i < FRAMES_IN_FLIGHT; ++i) {
+        VkDescriptorImageInfo descriptor_image_info = {
+            .sampler = VK_NULL_HANDLE,
+            .imageView = frame_view[i],
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        };
+
+        VkWriteDescriptorSet write_descriptor_set = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = NULL,
+            .dstSet = descriptor_set[i],
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .pImageInfo = &descriptor_image_info,
+        };
+
+        vkUpdateDescriptorSets(device, 1, &write_descriptor_set, 0, nullptr);
+    }
+
+    VkPushConstantRange push_constant_range = {
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0,
+        .size = sizeof(int) * 3,
+    };
+
+    VkPipelineLayoutCreateInfo pipeline_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .setLayoutCount = FRAMES_IN_FLIGHT,
+        .pSetLayouts = descriptor_set_layout.data(),
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push_constant_range,
+    };
+
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VK_CHECK(vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr, &pipeline_layout));
+
+    std::vector<uint32_t> compute_code = ReadSpirv(COMPUTE_SHADER_PATH);
+
+    VkShaderModuleCreateInfo shader_module_info = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .codeSize = compute_code.size() * sizeof(uint32_t),
+        .pCode = compute_code.data(),
+    };
+
+    VkShaderModule compute_shader_module = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateShaderModule(device, &shader_module_info, nullptr, &compute_shader_module));
+
+    VkPipelineShaderStageCreateInfo pipeline_shader_stage_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+        .module = compute_shader_module,
+        .pName = "main",
+    };
+
+    VkComputePipelineCreateInfo compute_pipeline_info = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .stage = pipeline_shader_stage_info,
+        .layout = pipeline_layout,
+    };
+
+    VkPipeline compute_pipeline = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &compute_pipeline_info, NULL, &compute_pipeline));
+
+    //--------------------------------------------------------------------------------------//
+    // SYNCHRONIZATION OBJECT CREATION
+    //--------------------------------------------------------------------------------------//
+
     VkSemaphoreCreateInfo semaphore_create_info = {
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-        .pNext = nullptr,
+        .pNext = NULL,
+        .flags = VK_SEMAPHORE_TYPE_BINARY,
+    };
+
+    VkFenceCreateInfo command_buffer_fence_info = {
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
         .flags = 0,
     };
 
-    //two semaphores, one to signal when an image in the swapchain has become available to be drawn over (i.e., it's not currently on-screen or in queue)
-    //and one to signal when we are finished drawing into a frame, thus it is ready to be queued for presentation to the screen
-    VkSemaphore image_available_semaphore = VK_NULL_HANDLE;
-    VkSemaphore render_finished_semaphore = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateSemaphore(device, &semaphore_create_info, nullptr, &image_available_semaphore));
-    VK_CHECK(vkCreateSemaphore(device, &semaphore_create_info, nullptr, &render_finished_semaphore));
+    std::vector<VkSemaphore> image_available_semaphore(FRAMES_IN_FLIGHT);
+    std::vector<VkSemaphore> render_finished_semaphore(swapchain_image_count);
+    std::vector<VkFence> in_flight_fence(FRAMES_IN_FLIGHT);
 
-    //--------------------------------------FRAME LOOP--------------------------------------//
+    for (uint32_t i = 0; i < FRAMES_IN_FLIGHT; ++i) {
+        VK_CHECK(vkCreateSemaphore(device, &semaphore_create_info, nullptr, &image_available_semaphore[i]));
+        VK_CHECK(vkCreateFence(device, &command_buffer_fence_info, nullptr, &in_flight_fence[i]));
+    }
+
+    for (uint32_t i = 0; i < swapchain_image_count; ++i) {
+        VK_CHECK(vkCreateSemaphore(device, &semaphore_create_info, nullptr, &render_finished_semaphore[i]));
+    }
+
+    //--------------------------------------------------------------------------------------//
+    // FRAME LOOP
+    //--------------------------------------------------------------------------------------//
+
+    //--------------------------------------------------------------------------------------//
+    // PART A: MOVE UNDEFINED -> GENERAL OUTSIDE THE LOOP
+    //--------------------------------------------------------------------------------------//
+    // Last assignment I stated that it was redundant to have the initial UNDEFINED -> GENERAL
+    // image barrier for every frame, since we are only ever in UNDEFINED at the very start of
+    // the program. We ought to now move it out of the main loop, to occur once right before
+    // the loop kicks off. If you recall, I stated in the A3 review that stating your image
+    // format is UNDEFINED tells Vulkan it can freely discard any data within it. If you
+    // choose to implement Feature1, where reading from a previous frame is required, this
+    // image barrier existing in the main loop suddenly becomes detrimental, because we
+    // absolutely do not want to discard previous frame data.
+    //
+    // Relevant structures: VkCommandBufferBeginInfo, VkImageSubresourceRange,
+    //                      VkImageMemoryBarrier2, VkDependencyInfo,
+    //                      VkCommandBufferSubmitInfo, VkSubmitInfo2
+    //
+    // Relevant functions:  vkResetCommandBuffer, vkBeginCommandBuffer, vkCmdPipelineBarrier2,
+    //                      vkEndCommandBuffer, vkQueueSubmit2
+    //
+    // Hints:   To record and submit the image barrier, you must go through the whole process
+    //          involved with recording to a command buffer, and submitting that buffer.
+    //
+    //          Make sure this image transition happens for all FRAMES_IN_FLIGHT images.
+    //
+    //          We don't need to wait on any semaphores for this operation. VkDependencyInfo
+    //          should reflect that.
+    //
+    //          We don't need to signal any semaphores for this operation. Fences, on the
+    //          other hand... In which case, should our fences still initialize as signaled?
+
+    //--------------------------------------------------------------------------------------//
+    // FEATURE1: TEMPORAL ACCUMULATION
+    //--------------------------------------------------------------------------------------//
+    // If you would like to use the previous frame's data to inform your current frame, there
+    // may be several roadblocks you run into. The primary concern is already somewhat handled
+    // by our FRAMES_IN_FLIGHT setup - that being, we cannot write to the same image we are
+    // reading from. Typically, if a solution wasn't already present, you would be pointed
+    // towards the concept of ping-pong buffers. The idea is that you have two images A and B,
+    // and on frame N you read data from image A and write your output to image B, then on
+    // frame N+1 you alternate to read from image B and write over image A. Currently we have
+    // images A B and C since FRAMES_IN_FLIGHT = 3, but I would recommend you lower it to 2,
+    // in order to easily replicate this described model.
+    //
+    // Even though we have this largely implemented already, you are currently sending in one
+    // image to your shader. This is reflected in your descriptor set mapping, and our image
+    // memory barriers. Both of these will have to change to accommodate the new setup. If we
+    // pass in both images every frame, then we need to perform layout transitions for both
+    // images every frame. Additionally, they can be easily slotted into one descriptor set
+    // as two descriptors of the same type.
+    //
+    // You ought to pass in current_frame as a push constant so that your shader knows which
+    // array index to read from and which to write to.
+
+    //--------------------------------------------------------------------------------------//
+    // FEATURE2: CURSOR IMAGE TRANSFORMATION
+    //--------------------------------------------------------------------------------------//
+    // A novel way to create interactivity with your shader art would be to have it transform
+    // in some way based on mouse information. Specifically, this feature necessitates you use
+    // cursor position to inform the final image, but optionally, utilizing mouse clicks may
+    // greatly widen the possibilities of your implementation.
+    //
+    // Using the mouse/cursor to zoom into your image or pan around a zoomed image does NOT
+    // qualify for this feature. Your art actually has to change based on mouse behavior. In
+    // the demo video, I made holding the cursor enable my fern to sway with the wind, while
+    // the position of my cursor influenced how the direction of the wind. While admittedly
+    // playing it a little loose with the cursor position implementation, I still consider
+    // this sufficient for the requirement. The key thing is that the position of the cursor
+    // actually mapped to something positional about my art. Like, there is a
+    // logical/intuitive connection to be made between moving the cursor around and seeing
+    // the fern react and sway differently. What would not suffice is to map some arbitrary
+    // non-positional value to the cursor position and call it a day. Unless it looks REALLY
+    // cool. Just don't be lazy.
+    //
+    // To get cursor position (and more generally, input data) you need to use glfw. For
+    // cursor position in particular, use glfwGetCursorPos which takes a pointer to the glfw
+    // window (called "window") and by reference two floats, since it provides subpixel
+    // precision. You can easily cast these to ints (or keep them as floats if you please) and
+    // send them to your shader as push constants.
+    //
+    // I'm feeling generous so I will also give you an instance of keystroke checking using
+    // glfw. It's for the space bar. The logic checks if the space bar was pressed down on
+    // that particular frame, and does not signal multiple times when held. You are not forced
+    // to use it.
+
+    //--------------------------------------------------------------------------------------//
+    // FEATURE3: DEPTH OF DETAIL
+    //--------------------------------------------------------------------------------------//
+    // The premise for this feature is simple - create practically infinite detail in your
+    // image generation, such that a camera can continuously zoom into your generation and not
+    // lose resolution or image clarity. This will work if your compute generation is
+    // mathematically formulaic, e.g., a fractal, but it can also work for other project types
+    // if you're creative enough.
+    //
+    // The primary mechanism to achieve this would be by having the image be a function of
+    // coordinates rather than discrete pixels, continuously evaluated based on the position
+    // of a viewing camera. Your viewing camera can simply be a center point and a scale, and
+    // your shader can map from pixel coordinates to worldspace coordinates, and vice versa.
+    // You would have to do your calculations, in general, in that worldspace coordinate
+    // plane, then translate your results to pixel coordinates. You can still dispatch one
+    // thread per pixel, as is currently done, since your frame dimensions aren't changing.
+    //
+    // This feature may be particularly hard to pair with Feature1 for a few reasons, but
+    // chiefly because the data we read from the prior image is in pixels. If you also store
+    // the camera data associated with that image, you could reverse the calculation back
+    // into worldspace coordinates. If you are zooming out or panning, then you cannot sample
+    // from a part of the image that did not previously exist, so a solution would have to be
+    // devised for that as well. If it doesn't break your intended result, simply resetting
+    // the image or choosing not to do temporal accumulation during camera movement could be
+    // an easy solution.
+    //
+    // To be clear, the zoom seen in my fern demo would NOT suffice for this feature. That did
+    // not resolve new detail and was just a simple crop of the blit. I imagine your
+    // implementation of this feature would leave the blit dimensions alone.
+
+
+    bool space_pressed = false;
+
+    uint32_t current_frame = 0;
+    uint64_t total_frames = 0;
+    std::chrono::milliseconds start_ms = duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch());
+    std::chrono::milliseconds curr_ms, end_ms;
+    std::chrono::milliseconds last_frame_ms = start_ms;
+    std::chrono::milliseconds delta_ms = start_ms;
+
+    VkImageSubresourceRange subresource_range = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+    };
+
+    for(uint32_t i = 0; i < FRAMES_IN_FLIGHT; ++i) {
+        VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .pNext = NULL,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        };
+
+        VK_CHECK(vkBeginCommandBuffer(command_buffers[i], &begin_info));
+
+        VkImageMemoryBarrier2 barrier_storage_to_transfer_dst = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .pNext = NULL,
+
+            .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+            .srcAccessMask = VK_ACCESS_2_NONE,
+
+            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+
+            .image = frame[i],
+            .subresourceRange = subresource_range,
+        };
+
+        VkImageMemoryBarrier2 world_barrier = barrier_storage_to_transfer_dst;
+
+        world_barrier.image = world[i];
+
+        world_barrier.dstAccessMask =
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+
+        VkImageMemoryBarrier2 barriers[] = {
+            barrier_storage_to_transfer_dst,
+            world_barrier
+        };
+        
+        VkDependencyInfo dependency_info = {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .pNext = NULL,
+            .imageMemoryBarrierCount = 2,
+            .pImageMemoryBarriers = barriers,
+        };
+        
+        vkCmdPipelineBarrier2(command_buffers[i], &dependency_info);
+
+        VK_CHECK(vkEndCommandBuffer(command_buffers[i]));
+
+        VkCommandBufferSubmitInfo cmd_submit_info = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+            .pNext = NULL,
+            .commandBuffer = command_buffers[i],
+            .deviceMask = 0,
+        };
+
+        VkSubmitInfo2 submit_info = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+            .pNext = NULL,
+
+            .waitSemaphoreInfoCount = 0,
+            .pWaitSemaphoreInfos = nullptr,
+
+            .commandBufferInfoCount = 1,
+            .pCommandBufferInfos = &cmd_submit_info,
+
+            .signalSemaphoreInfoCount = 0,
+            .pSignalSemaphoreInfos = nullptr,
+        };
+
+        VK_CHECK(vkQueueSubmit2(queue, 1, &submit_info, in_flight_fence[i]));
+    }
+
+    std::random_device rand;
+    std::mt19937 rng(rand());
+    std::uniform_int_distribution<uint32_t> dist;
+
+    int seed = dist(rng);
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
-        //ask for an image to draw into. the index is not guaranteed to be sequential, so never assume such
-        //i.e., it may advance by more than one so don't plan around a consistent index increment
-        //semaphores are device side, so the host (our CPU/C++ side) keeps moving
+        vkWaitForFences(device, 1, &in_flight_fence[current_frame], VK_TRUE, UINT64_MAX);
+        vkResetFences(device, 1, &in_flight_fence[current_frame]);
+
         uint32_t image_index = 0;
-        VkResult acquire_result = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, image_available_semaphore, VK_NULL_HANDLE, &image_index);
+        VkResult acquire_result = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, image_available_semaphore[current_frame], VK_NULL_HANDLE, &image_index);
 
         if (acquire_result != VK_SUCCESS && acquire_result != VK_SUBOPTIMAL_KHR) {
             std::fprintf(stderr, "vkAcquireNextImageKHR failed with VkResult %d\n", acquire_result);
             return EXIT_FAILURE;
         }
 
-        VK_CHECK(vkResetCommandBuffer(command_buffer, 0));
+        if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS && !space_pressed) {
+            //logic for pressing the space bar would go here
+        }
+
+        space_pressed = (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS); //must happen after the logic
+
+        VK_CHECK(vkResetCommandBuffer(command_buffers[current_frame], 0));
 
         VkCommandBufferBeginInfo command_buffer_begin_info = {
             .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-            .pNext = nullptr,
+            .pNext = NULL,
             .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-            .pInheritanceInfo = nullptr,
         };
 
-        //this command also implicitly resets the command buffer so vkResetCommandBuffer exists moreso to show intent of buffer override
-        VK_CHECK(vkBeginCommandBuffer(command_buffer, &command_buffer_begin_info));
+        VK_CHECK(vkBeginCommandBuffer(command_buffers[current_frame], &command_buffer_begin_info));
 
-        //describe which parts of the image the following operations apply to
-        VkImageSubresourceRange image_subresource_range = {
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel = 0,
-            .levelCount = 1,
-            .baseArrayLayer = 0,
-            .layerCount = 1,
-        };
 
-        //when we receive an image from vkAcquireNextImageKHR, it returns in an undefined layout.
-        //we need to make sure that our image is in a writable format before we put anything in it
-        VkImageMemoryBarrier2 barrier_to_transfer_dst = {
+        int pc[] = {(int)FRAME_WIDTH, (int)FRAME_HEIGHT, seed};
+
+        vkCmdBindPipeline(command_buffers[current_frame], VK_PIPELINE_BIND_POINT_COMPUTE, compute_pipeline);
+        vkCmdBindDescriptorSets(command_buffers[current_frame], VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1, &descriptor_set[current_frame], 0, nullptr);
+        vkCmdPushConstants(command_buffers[current_frame], pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(command_buffers[current_frame], (FRAME_WIDTH + 15) / 16, (FRAME_HEIGHT + 15) / 16, 1);
+
+        VkImageMemoryBarrier2 barrier_storage_to_transfer_src = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-            .pNext = nullptr,
+            .pNext = NULL,
 
-            //wait for all commands submitted before this barrier to reach this stage...
-            .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+            .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+
+            .dstStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT,
+            .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT,
+
+            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+
+            .image = frame[current_frame],
+            .subresourceRange = subresource_range,
+        };
+
+        VkImageMemoryBarrier2 barrier_to_swapchain_transfer_dst = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .pNext = NULL,
+
+            .srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT,
             .srcAccessMask = VK_ACCESS_2_NONE,
 
-            //before any commands submitted after this barrier can begin this stage...
-            .dstStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT,
             .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-            
-            //the NONE stage means we don't actually have to wait on any particular stage.
-            //this is fine in this case because we have a semaphore that waits for the image to be required anyway
 
             .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
             .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -449,98 +1085,122 @@ int main()
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             
             .image = swapchain_images[image_index],
-            .subresourceRange = image_subresource_range,
+            .subresourceRange = subresource_range,
         };
 
-        VkDependencyInfo dependency_info_to_transfer_dst = {
+        VkImageMemoryBarrier2 barriers_before_blit[2] = {barrier_storage_to_transfer_src, barrier_to_swapchain_transfer_dst};
+
+        VkDependencyInfo dependency_info_before_blit = {
             .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-            .pNext = nullptr,
+            .pNext = NULL,
             .dependencyFlags = 0,
             .memoryBarrierCount = 0,
             .pMemoryBarriers = nullptr,
             .bufferMemoryBarrierCount = 0,
             .pBufferMemoryBarriers = nullptr,
-            .imageMemoryBarrierCount = 1,
-            .pImageMemoryBarriers = &barrier_to_transfer_dst,
+            .imageMemoryBarrierCount = 2,
+            .pImageMemoryBarriers = barriers_before_blit,
         };
 
-        //throw our barrier into the command buffer via the dependency
-        vkCmdPipelineBarrier2(command_buffer, &dependency_info_to_transfer_dst);
+        vkCmdPipelineBarrier2(command_buffers[current_frame], &dependency_info_before_blit);
 
-        //cornflower blue =D
-        VkClearColorValue clear_color = {.float32 = {0.3f, 0.5f, 0.8f, 1.f}};
+        VkImageBlit image_blit = {
+            .srcSubresource = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .srcOffsets = { {0, 0, 0}, {FRAME_WIDTH, FRAME_HEIGHT, 1} },
+            .dstSubresource = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .dstOffsets = { {0, 0, 0}, {(int32_t)swapchain_extent.width, (int32_t)swapchain_extent.height, 1} },
+        };
 
-        //number of VkImageSubresourceRange structs in &image_subresource_range
-        uint32_t range_count = 1;
+        vkCmdBlitImage(command_buffers[current_frame], frame[current_frame], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchain_images[image_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &image_blit, VK_FILTER_LINEAR);
 
-        //fill the swapchain image with our clear color
-        vkCmdClearColorImage(command_buffer, swapchain_images[image_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear_color, range_count, &image_subresource_range);
-
-        //wait until we've finished clearing (overwriting) the swapchain image with our color before we execute any following commands
         VkImageMemoryBarrier2 barrier_to_present = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-            .pNext = nullptr,
+            .pNext = NULL,
 
-            .srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT,
+            .srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT,
             .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-            
+
             .dstStageMask = VK_PIPELINE_STAGE_2_NONE,
             .dstAccessMask = VK_ACCESS_2_NONE,
-            
+
             .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-            
+
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            
+
             .image = swapchain_images[image_index],
-            .subresourceRange = image_subresource_range,
+            .subresourceRange = subresource_range,
         };
+
+        VkImageMemoryBarrier2 barrier_to_general = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .pNext = NULL,
+
+            .srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT,
+            .srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT,
+
+            .dstStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT,
+            .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+ 
+            .image = frame[current_frame],
+            .subresourceRange = subresource_range,
+        };
+
+        VkImageMemoryBarrier2 barriers_after_blit[2] = {barrier_to_present, barrier_to_general};
 
         VkDependencyInfo dependency_info_to_present = {
             .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-            .pNext = nullptr,
+            .pNext = NULL,
             .dependencyFlags = 0,
             .memoryBarrierCount = 0,
             .pMemoryBarriers = nullptr,
             .bufferMemoryBarrierCount = 0,
             .pBufferMemoryBarriers = nullptr,
-            .imageMemoryBarrierCount = 1,
-            .pImageMemoryBarriers = &barrier_to_present,
+            .imageMemoryBarrierCount = 2,
+            .pImageMemoryBarriers = barriers_after_blit,
         };
-        
-        //submit the barrier
-        vkCmdPipelineBarrier2(command_buffer, &dependency_info_to_present);
 
-        //finally, we tell the command buffer it can stop listening for new commands
-        VK_CHECK(vkEndCommandBuffer(command_buffer));
+        vkCmdPipelineBarrier2(command_buffers[current_frame], &dependency_info_to_present);
 
-        //now we are focused on submitting this command buffer to the queue
+        VK_CHECK(vkEndCommandBuffer(command_buffers[current_frame]));
 
-        //describe and assign the semaphore we signal when we hit the CLEAR stage
-        //(which tells us that the image is ready to be cleared and is thus "available")
         VkSemaphoreSubmitInfo wait_semaphore_info = {
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-            .pNext = nullptr,
-            .semaphore = image_available_semaphore,
+            .pNext = NULL,
+            .semaphore = image_available_semaphore[current_frame],
             .value = 0,
-            .stageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT,
+            .stageMask = VK_PIPELINE_STAGE_2_BLIT_BIT,
             .deviceIndex = 0,
         };
 
         VkCommandBufferSubmitInfo command_buffer_submit_info = {
             .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-            .pNext = nullptr,
-            .commandBuffer = command_buffer,
+            .pNext = NULL,
+            .commandBuffer = command_buffers[current_frame],
             .deviceMask = 0,
         };
 
-        //semaphore to signal when the image is ready for presentation.
-        //the whole command buffer must be complete before presenting the image
         VkSemaphoreSubmitInfo signal_semaphore_info = {
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-            .pNext = nullptr,
-            .semaphore = render_finished_semaphore,
+            .pNext = NULL,
+            .semaphore = render_finished_semaphore[image_index],
             .value = 0,
             .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
             .deviceIndex = 0,
@@ -548,7 +1208,7 @@ int main()
 
         VkSubmitInfo2 submit_info = {
             .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-            .pNext = nullptr,
+            .pNext = NULL,
             .flags = 0,
             .waitSemaphoreInfoCount = 1,
             .pWaitSemaphoreInfos = &wait_semaphore_info,
@@ -558,17 +1218,13 @@ int main()
             .pSignalSemaphoreInfos = &signal_semaphore_info,
         };
 
-        //submit the command buffer to the queue 
-        VK_CHECK(vkQueueSubmit2(queue, 1, &submit_info, VK_NULL_HANDLE));
-
-        //there wasn't a command in the buffer that said "now present this image to the screen"
-        //here is where we say "okay, once all of that is finished, the presentation engine can display that image"
+        VK_CHECK(vkQueueSubmit2(queue, 1, &submit_info, in_flight_fence[current_frame]));
 
         VkPresentInfoKHR present_info = {
             .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-            .pNext = nullptr,
+            .pNext = NULL,
             .waitSemaphoreCount = 1,
-            .pWaitSemaphores = &render_finished_semaphore,
+            .pWaitSemaphores = &render_finished_semaphore[image_index],
             .swapchainCount = 1,
             .pSwapchains = &swapchain,
             .pImageIndices = &image_index,
@@ -581,22 +1237,59 @@ int main()
             return EXIT_FAILURE;
         }
 
-        //now we tell our LOGICAL device (not our GPU, which is our physical device) to become idle
-        //i.e., we wait for everything we've put on the queue to begin execution before giving the host more work 
-        VK_CHECK(vkDeviceWaitIdle(device));
+        curr_ms = duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch());
+        delta_ms = curr_ms - last_frame_ms;
+        last_frame_ms = curr_ms;
+        current_frame = (current_frame + 1) % FRAMES_IN_FLIGHT;
+        total_frames++;
     }
 
-    //----------------------------------------CLEANUP---------------------------------------//
-    
-    //let's wait for everything to finish on the host side before destroying anything
+    //let's wait for everything to finish on the host side before cleaning up or finalizing timers
     VK_CHECK(vkDeviceWaitIdle(device));
+
+    end_ms = duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch());
+    delta_ms = end_ms - start_ms;
+
+    double fps = (double)total_frames / (delta_ms.count() / 1000.0);
+    std::printf("Avg FPS: %i\n", int(fps));
 
     //destruction generally goes in reverse order of creation
 
-    vkDestroySemaphore(device, render_finished_semaphore, nullptr);
-    vkDestroySemaphore(device, image_available_semaphore, nullptr);
+    for (uint32_t i = 0; i < swapchain_image_count; ++i) {
+        vkDestroySemaphore(device, render_finished_semaphore[i], nullptr);
+    }
+
+    for (uint32_t i = 0; i < FRAMES_IN_FLIGHT; ++i) {
+        vkDestroySemaphore(device, image_available_semaphore[i], nullptr);
+        vkDestroyFence(device, in_flight_fence[i], nullptr);
+    }
+
+    vkDestroyPipeline(device, compute_pipeline, nullptr);
+    
+    vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
+
+    vkDestroyShaderModule(device, compute_shader_module, nullptr);
+
+    for (uint32_t i = 0; i < FRAMES_IN_FLIGHT; ++i) {
+        vkDestroyDescriptorSetLayout(device, descriptor_set_layout[i], nullptr);
+    }
+
+    vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
 
     vkDestroyCommandPool(device, command_pool, nullptr);
+
+    for (uint32_t i = 0; i < FRAMES_IN_FLIGHT; ++i) {
+        vkDestroyImageView(device, frame_view[i], nullptr);
+        vkDestroyImage(device, frame[i], nullptr);
+    }
+
+    for (uint32_t i = 0; i < 2; ++i) {
+        vkDestroyImageView(device, world_view[i], nullptr);
+        vkDestroyImage(device, world[i], nullptr);
+    }
+
+    vkFreeMemory(device, frame_memory, nullptr);
+    vkFreeMemory(device, world_memory, nullptr);
 
     vkDestroySwapchainKHR(device, swapchain, nullptr);
 

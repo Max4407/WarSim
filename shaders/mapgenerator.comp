@@ -1,0 +1,87 @@
+#version 450
+
+//--------------------------------------------------------------------------------------//
+// PART B: YOUR COMPUTE CANVAS
+//--------------------------------------------------------------------------------------//
+// The real meat of the assignment. Your goal is to create something visually compelling
+// that meets two of the three feature requirements and some more general requirements:
+//
+// Every visible pixel must be computed within the shader, rather than supplied to it.
+// Ping-pong buffers do not count, since the prior result was also computed by the same
+// shader.
+//
+// Pixel color depends in some form on pixel position. This could be from a more
+// generalized coordinate system or directly from the integer coordinates of the pixel.
+//
+// The effect differs significantly from the provided shader and from your Assignment2
+// implementation in nature.
+//
+// The effect is somewhat based on an existing procedural artistic concept. Pixel values
+// cannot be hard-coded and must be derived from some calculation/algorithm.
+//
+// If you have an idea that you believe may not fully meet these requirements but still
+// has artistic and intellectual merit, please reach out to me directly for idea approval.
+//
+// You are not required to use a single compute shader, though it is highly encouraged.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, r32ui)
+uniform writeonly uimage2D world_output;
+
+layout(push_constant) uniform PushConstants {
+    int width;
+    int height;
+    int seed;
+} pc;
+
+// 2D Random
+float random(ivec2 point) {
+    uvec2 p = uvec2(point);
+
+    uint h = p.x * 374761393u + p.y * 668265263u + pc.seed * 2246822519u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    h ^= h >> 16;
+
+    return float(h & 0x00FFFFFFu) / 16777216.0;
+}
+
+// 2D Value Noise
+float noise(in vec2 st) {
+    ivec2 i = ivec2(floor(st));
+    vec2 f = fract(st);
+
+    // Four corners in 2D of a tile
+    float a = random(i);
+    float b = random(i + ivec2(1, 0));
+    float c = random(i + ivec2(0, 1));
+    float d = random(i + ivec2(1, 1));
+
+    // Smooth Interpolation
+    vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+
+    // Mix 4 corners percentages
+    float bottom = mix(a, b, u.x);
+    float top = mix(c, d, u.x);
+
+    return mix(bottom, top, u.y);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+
+    if (pixel.x >= pc.width || pixel.y >= pc.height)
+        return;
+
+    vec2 st = vec2(pixel) / vec2(pc.width, pc.height);
+
+    // Scale the coordinate system
+    vec2 pos = st * 4.0;
+
+    // Use the noise function
+    float n = noise(pos);
+
+    uint cell = n < 0.4 ? 0u : 1u;
+
+    imageStore(world_output, pixel, uvec4(cell, 0u, 0u, 0u));
+}
